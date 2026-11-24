@@ -1,0 +1,156 @@
+---
+title: "Open-Source Speech-to-Text Diarization"
+subtitle: "State of the Art in Open-Source ASR and Speaker Diarization for Debate Analysis: A 2025 Technical Report"
+bibliography: "open-source-speech-to-text-diarization.bib"
+draft: true
+---
+
+## **Executive Summary**
+
+Debate audio is messy: people interrupt, talk over each other, and audio quality varies wildly. We now have open-source tools that can handle this better than a few years ago, but the value comes from how you combine them, not from memorizing every architecture detail. This report focuses on what to use and how to use it for long, informal debates, with only brief notes on why the newer models work.
+
+## Key Takeaways
+
+1. **LLM-powered ASR helps with context and jargon:** Models like Canary-Qwen and Granite pair an audio encoder with an LLM decoder, so they better guess domain terms and names in chaotic speech.
+2. **Overlap-aware diarization matters:** Neural diarizers (e.g., NeMo MSDD) detect when two people talk at once and keep both voices, which is key for debates full of interruptions.
+3. **One-pass speaker-tagged ASR is emerging:** Newer joint models (SpeakerLM, DiCoW) can produce transcripts with speaker tags directly, reducing pipeline glue work.
+
+## The Computational Phenomenology of Debate Analysis
+
+Transcribing a debate is fundamentally different from transcribing a voicemail or a lecture. The "informal debate" scenario presents a unique adversarial acoustic environment.
+
+### Why Debate Audio Is Hard (in plain language)
+
+- People talk over each other, and you need both voices.
+- Exchanges are fast and clipped; the system must react to split-second turns.
+- Audio quality swings: studio mics, Zoom callers, room echo, background noise.
+- Domain jargon and names matter; context helps pick the right words.
+
+## The Evolution of ASR Architectures: From Pipelines to Hybrids
+
+The ASR landscape in 2025 is dominated by the fusion of acoustic encoders with Large Language Model (LLM) decoders. This "Speech-Augmented Language Model" (SALM) approach represents a move away from purely acoustic modeling toward systems that "understand" speech as much as they "hear" it.
+
+### Quick note on why newer models help
+
+Modern ASR pairs an audio encoder with an LLM-style decoder. The encoder hears; the LLM guesses context, jargon, and names. Diarizers now look at multiple time scales so they catch both fast turn-taking and who is speaking. That is enough background to pick the right tools.
+
+## State-of-the-Art Open-Source ASR Models (2025 Analysis)
+
+Based on the Open ASR Leaderboard and recent benchmarking data, four primary models define the solution space for debate transcription.
+
+### Practical model picks (with quick reasons)
+
+- **Canary-Qwen-2.5B:** Highest open-source accuracy for English; good with names and jargon; needs a strong GPU.
+- **Granite Speech 3.3:** Similar accuracy but shines on very long sessions because of its big context window.
+- **Whisper Large V3 (or Turbo):** Most robust to accents/noise and handles many languages; a solid default if you want simplicity and speed.
+- **Parakeet TDT:** Ultra-fast streaming; slightly less accurate but great for live dashboards.
+
+Architecturally, Canary/Granite use an LLM decoder for context, Whisper is a classic encoder-decoder trained on noisy web audio, and Parakeet is an RNN-T built for speed.
+
+## The Speaker Diarization Renaissance: Neural vs. Clustering
+
+Transcription is only half the battle. Attributing each utterance to the correct speaker ("Diarization") is critical. The 2025 landscape sees a fierce competition between the established modular approach (Pyannote) and the newer, overlap-aware neural approaches (NeMo).
+
+### Diarization options (who spoke when)
+
+- **Pyannote 3.1:** Easy, modular, good baseline. Handles speech segmentation and clustering but is weaker on heavy overlaps.
+- **NeMo MSDD:** Neural, overlap-aware, better for interruption-heavy debates. Needs more setup but pays off when two people talk at once.
+
+### Joint models (one pass, tagged text)
+
+- **SpeakerLM:** Produces transcripts with speaker tags in one shot; can use pre-registered voices or work blind.
+- **DiCoW:** A Whisper variant that can focus on one speaker at a time using diarization cues; helpful for clean separation of overlaps.
+
+## Practical pipelines you can actually run
+
+### Pipeline A: Accuracy-first offline analysis (recommended)
+
+1. Denoise if needed (e.g., NeMo denoiser).
+2. Diarize with **NeMo MSDD**; set `max_speakers` to expected panel size.
+3. Transcribe with **Canary-Qwen**; cut audio by diarization timestamps. For overlaps, run ASR separately for each speaker slice.
+4. Align text to audio for clean timestamps (forced alignment).
+
+When to use: archival debates where precision matters.
+
+### Pipeline B: Unified, fewer moving parts
+
+1. Run **SpeakerLM** in no-registration mode on the full audio.
+2. Post-process the tagged transcript for analytics (arguments, rebuttals, counts of interruptions).
+
+When to use: good GPU available; want simplicity and tagged output in one pass.
+
+### Pipeline C: Fast and light
+
+1. Use **WhisperX** (Whisper + VAD + alignment) with int8 quantization if VRAM is limited.
+2. Accept that overlaps favor the loudest speaker; add Pyannote for basic diarization if needed.
+
+When to use: consumer GPU/CPU, quick turnaround, multilingual or noisy audio.
+
+## Practical Implementation: Pipeline Recipes
+
+Constructing a debate analysis system in 2025 requires assembling these components into a coherent pipeline. We provide three "recipes" catering to different resource and accuracy profiles.
+
+### Recipe A: The "Production Accuracy" Pipeline (Recommended)
+
+*Best for: High-quality offline analysis of archived debates where accuracy is paramount.*
+
+1. **Preprocessing:** Use **NVIDIA NeMo** to perform noise reduction (denoising) if the debate source is informal/noisy.  
+2. **Diarization:** Deploy **NeMo MSDD**.  
+   * *Config:* Set `sigmoid_threshold` to 0.7 to tune overlap sensitivity. Set `max_speakers` to the panel size (e.g., 6) to constrain clustering.
+   * *Output:* An RTTM file with precise, overlap-aware timestamps.
+3. **ASR:** Deploy **NVIDIA Canary-Qwen-2.5B**.
+   * *Orchestration:* Use the RTTM timestamps to cut the audio into speaker-specific chunks. For overlapping segments identified by MSDD, pass the audio to a source separator (like **SepFormer**) or run the ASR twice (once for each speaker).
+   * *Prompting:* Pre-prompt the Canary model with the debate topic to prime the LLM decoder.
+4. **Post-Processing:** Use **CTC-Forced Alignment** to re-align the text to the audio frame-by-frame, correcting any drift.
+
+### Recipe B: The "Unified SOTA" Pipeline (Cutting Edge)
+
+*Best for: Users with high-end hardware (A100/H100) seeking a simplified deployment.*
+
+1. **Core Model:** **SpeakerLM (Qwen-2.5 based)**.  
+   * *Deployment:* Deploy in "No-Regist" mode.  
+   * *Input:* Raw audio file.  
+   * *Output:* Fully attributed text with serialized overlaps.  
+2. **Analysis:** Feed the SpeakerLM output directly into a reasoning LLM (e.g., Llama 3) to extract "Arguments," "Rebuttals," and "Logical Fallacies." The text-based speaker tags of SpeakerLM are naturally optimized for this downstream LLM processing.
+
+### Recipe C: The "Resource-Efficient" Pipeline
+
+*Best for: Running on consumer hardware (e.g., single RTX 3090/4090).*
+
+1. **Pipeline:** **WhisperX**.  
+   * WhisperX wraps **Faster-Whisper** (C++ implementation) and **Pyannote**.
+   * *Mechanism:* It uses VAD to pre-segment audio, drastically improving batching and speed. It performs forced alignment to fix Whisper's timestamp hallucinations.
+2. **Optimization:** Use int8 quantization for the Whisper model to fit Large-V3 into <8GB VRAM.
+3. **Trade-off:** This pipeline will miss overlaps (it will likely transcribe only the dominant speaker), but it is 50x faster than real-time and easy to install.
+
+### Hardware cheat sheet
+
+- **Canary-Qwen / SpeakerLM:** ~24GB VRAM for FP16; 4-bit can work on 12–16GB with some quality trade-off.
+- **Whisper V3/Turbo:** Comfortable on 12GB cards.
+- **Parakeet:** Lightweight; great for real-time on data center GPUs.
+
+## Try this on a long informal debate
+
+1. Pick a 45–60 minute panel recording (YouTube export is fine).
+2. Start with Pipeline C (WhisperX) to get a fast baseline and see pain points.
+3. Re-run a 5–10 minute chaotic segment with Pipeline A (NeMo MSDD + Canary-Qwen) to capture overlaps and compare quality.
+4. If you want tags in one pass, run the same segment through SpeakerLM and compare speaker labeling.
+5. Decide which pipeline balances speed, accuracy, and complexity for your use case, then scale to the full debate.
+
+## Works cited
+
+1. [Multi-Stage Speaker Diarization for Noisy Classrooms](https://arxiv.org/html/2505.10879v1)
+2. [Models — NVIDIA NeMo Framework User Guide](https://docs.nvidia.com/nemo-framework/user-guide/24.09/nemotoolkit/asr/speaker_diarization/models.html)
+3. [Open ASR Leaderboard: Towards Reproducible and Transparent Multilingual and Long-Form Speech Recognition Evaluation](https://arxiv.org/pdf/2510.06961)
+5. [The Top Open Source Speech-to-Text (STT) Models in 2025](https://modal.com/blog/open-source-stt)
+7. [nvidia/canary-qwen-2.5b](https://huggingface.co/nvidia/canary-qwen-2.5b)
+8. [Open ASR Leaderboard: Trends and Insights with New Multilingual & Long-Form Tracks](https://huggingface.co/blog/open-asr-leaderboard)
+9. [Best open source speech-to-text (STT) model in 2025 (with benchmarks)](https://northflank.com/blog/best-open-source-speech-to-text-stt-model-in-2025-benchmarks)
+10. [granite-3.3-8b-instruct Model by IBM — NVIDIA NIM APIs](https://huggingface.co/ibm-granite/granite-3.3-8b-instruct)
+12. [openai/whisper-large-v3 — Hugging Face](https://huggingface.co/openai/whisper-large-v3)
+13. [WhisperX: Automatic Speech Recognition with Word-level Timestamps (& Diarization)](https://github.com/m-bain/whisperX)
+14. [VR-13/WhisperX](https://github.com/VR-13/WhisperX)
+15. [pyannote/pyannote-audio: Neural building blocks for speaker diarization](https://github.com/pyannote/pyannote-audio)
+16. [Best Speaker Diarization Models Compared (2025)](https://brasstranscripts.com/blog/speaker-diarization-models-comparison)
+17. [Benchmarking Diarization Models](https://arxiv.org/html/2509.26177v1)
+18. [What Is Speaker Diarization? A 2025 Technical Guide](https://www.marktechpost.com/2025/08/21/what-is-speaker-diarization-a-2025-technical-guide-top-9-speaker-diarization-libraries-and-apis-in-2025/)

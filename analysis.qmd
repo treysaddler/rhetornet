@@ -1,0 +1,194 @@
+---
+title: "Rhetornet Debate Analysis"
+---
+
+We're going to implement the pipelines outlined in `open-source-speech-to-text-report.qmd`. Target setup: Windows + RTX 3090, but keep things platform-agnostic where possible. First step: pull audio from the debate video and stand up the resource-efficient Pipeline C (WhisperX) as a baseline.
+
+## Setup: paths and config
+
+```{python}
+from pathlib import Path
+import os
+
+# Repro and deterministic-ish behavior where supported
+try:
+	import torch
+
+	# Allow pyannote checkpoints that rely on OmegaConf objects under torch 2.6+ loaders
+	try:
+		import omegaconf
+
+		torch.serialization.add_safe_globals([omegaconf.listconfig.ListConfig])
+	except Exception:
+		pass
+
+	torch.manual_seed(123)
+except ImportError:
+	torch = None
+
+DATA_DIR = Path("data")
+RAW_DIR = DATA_DIR / "raw"
+PROCESSED_DIR = DATA_DIR / "processed"
+for path in (RAW_DIR, PROCESSED_DIR):
+	path.mkdir(parents=True, exist_ok=True)
+
+VIDEO_URL = "https://www.youtube.com/watch?v=7Q_ulRcczoc"
+AUDIO_BASENAME = "debate_clip"
+AUDIO_PATH = RAW_DIR / f"{AUDIO_BASENAME}.mp3"
+
+DEVICE = "cuda" if (torch and torch.cuda.is_available()) else "cpu"
+print(f"Using device: {DEVICE}")
+
+def cleanup_gpu():
+	"""Force garbage collection and clear CUDA cache."""
+	import gc
+	gc.collect()
+	if torch and torch.cuda.is_available():
+		torch.cuda.empty_cache()
+		print("GPU memory cleared.")
+
+```
+
+## Download the debate audio (YouTube)
+
+Requires `ffmpeg` on PATH and `yt-dlp` installed (see requirements.txt). The embed URL is mapped to the watch URL for better compatibility with `yt-dlp`.
+
+```{python}
+import yt_dlp
+
+def download_audio(url: str, audio_path: Path) -> Path:
+	"""Download and extract audio to MP3; skips if the file already exists."""
+
+	if audio_path.exists():
+		print(f"Audio already present at {audio_path}")
+		return audio_path
+
+	ydl_opts = {
+		"format": "bestaudio/best",
+		"outtmpl": str(audio_path.with_suffix(".%(ext)s")),
+		"postprocessors": [
+			{
+				"key": "FFmpegExtractAudio",
+				"preferredcodec": "mp3",
+				"preferredquality": "192",
+			}
+		],
+		"quiet": False,
+		"noplaylist": True,
+	}
+
+	with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+		print(f"Downloading audio from {url}...")
+		ydl.download([url])
+
+	final_path = audio_path if audio_path.exists() else audio_path.with_suffix(".mp3")
+	print(f"Saved audio to {final_path}")
+	return final_path
+
+
+download_audio(VIDEO_URL, AUDIO_PATH)
+```
+
+## Pipeline C baseline: WhisperX (fast, resource-efficient)
+
+This chunk runs WhisperX for transcription, alignment, and optional diarization. Diarization requires a `HUGGINGFACE_TOKEN` env var for pyannote weights; if absent, the step is skipped. Outputs stay under `data/processed/` and are not meant for git.
+
+```{python}
+import json
+from typing import Dict, Any
+
+import whisperx
+import dotenv
+import torch
+import omegaconf
+import typing
+import collections
+import builtins
+
+def load_whisperx_model(device: str):
+    # Register both OmegaConf AND standard Python types for PyTorch 2.6+
+    torch.serialization.add_safe_globals([
+        # OmegaConf specific
+        omegaconf.base.ContainerMetadata,
+        omegaconf.listconfig.ListConfig,
+        omegaconf.dictconfig.DictConfig,
+        # Standard Python types often found in legacy configs
+        builtins.int,
+        builtins.float,
+        builtins.str,
+        builtins.list,
+        builtins.dict,
+        builtins.set,
+        builtins.tuple,
+        typing.Any,
+        collections.defaultdict,
+    ])
+
+    compute_type = "float16" if device == "cuda" else "int8"
+    return whisperx.load_model(
+        "large-v3",
+        device=device,
+        compute_type=compute_type,
+    )
+
+
+def transcribe_with_whisperx(audio_path: Path, device: str) -> Dict[str, Any]:
+	if not audio_path.exists():
+		raise FileNotFoundError(f"Audio not found at {audio_path}; run the download step first.")
+
+	# Load environment variables from a local .env if present (e.g., HUGGINGFACE_TOKEN)
+	dotenv.load_dotenv()
+
+	model = load_whisperx_model(device)
+	audio = whisperx.load_audio(str(audio_path))
+	result = model.transcribe(audio, batch_size=16)
+
+	align_model, metadata = whisperx.load_align_model(
+		language_code=result["language"], device=device
+	)
+	result = whisperx.align(
+		result["segments"], align_model, metadata, audio, device, return_char_alignments=False
+	)
+
+	hf_token = os.getenv("HUGGINGFACE_TOKEN")
+	if hf_token:
+		diarize_model = whisperx.DiarizationPipeline(
+			use_auth_token=hf_token, device=device, batch_size=32
+		)
+		diarize_segments = diarize_model(str(audio_path))
+		result = whisperx.assign_word_speakers(diarize_segments, result)
+	else:
+		print("Skipping diarization (set HUGGINGFACE_TOKEN to enable pyannote weights).")
+
+	return result
+
+
+def save_transcript(payload: Dict[str, Any], processed_dir: Path) -> None:
+	processed_dir.mkdir(parents=True, exist_ok=True)
+	json_path = processed_dir / "whisperx_transcript.json"
+	with open(json_path, "w", encoding="utf-8") as f:
+		json.dump(payload, f, ensure_ascii=False, indent=2)
+	print(f"Saved transcript JSON to {json_path}")
+
+	try:
+		import pandas as pd
+
+		df = pd.DataFrame(payload.get("segments", []))
+		parquet_path = processed_dir / "whisperx_transcript.parquet"
+		df.to_parquet(parquet_path, index=False)
+		print(f"Saved segment table to {parquet_path}")
+	except ImportError:
+		print("pandas not installed; skipping dataframe export.")
+
+
+# Run the pipeline
+cleanup_gpu()
+whisperx_result = transcribe_with_whisperx(AUDIO_PATH, DEVICE)
+save_transcript(whisperx_result, PROCESSED_DIR)
+```
+
+## Next steps
+
+- Compare a focused 5–10 minute segment with Pipeline A (NeMo MSDD + Canary-Qwen) for overlap-heavy regions.
+- If you want one-pass speaker tags, swap in SpeakerLM and evaluate tagging quality against the WhisperX diarization output.
+- Wire the processed transcripts into downstream argument/rebuttal extraction once we have the baseline transcript quality.

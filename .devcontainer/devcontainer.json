@@ -1,0 +1,27 @@
+{
+  "name": "rhetornet-pytorch",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "runArgs": [
+    "--gpus=all",
+    "--shm-size=8g"
+  ],
+  "mounts": [
+    "source=${localWorkspaceFolder},target=/workspace,type=bind"
+  ],
+  "workspaceFolder": "/workspace",
+  "remoteUser": "root",
+  "postCreateCommand": "uv sync",
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "python.defaultInterpreterPath": "/workspace/.venv/bin/python"
+      },
+      "extensions": [
+        "ms-python.python",
+        "ms-toolsai.jupyter"
+      ]
+    }
+  }
+}
